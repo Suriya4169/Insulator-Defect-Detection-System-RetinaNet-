@@ -186,6 +186,16 @@ class CustomCocoDataset(torch.utils.data.Dataset):
         # Categories mapping
         self.categories = {cat['id']: cat['name'] for cat in self.coco_data['categories']}
 
+        # Pre-cache defect flag for weighted sampling
+        self.has_defect = []
+        for img_id in self.ids:
+            found = False
+            for ann in self.img_to_anns.get(img_id, []):
+                if ann['category_id'] == 1:
+                    found = True
+                    break
+            self.has_defect.append(found)
+
     def __getitem__(self, index):
         img_id = self.ids[index]
         img_info = self.images[img_id]

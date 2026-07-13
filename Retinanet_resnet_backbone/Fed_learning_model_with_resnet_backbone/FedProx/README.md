@@ -1,5 +1,4 @@
-# Phase 1 — FedProx Algorithmic Upgrade
-
+# FedProx Algorithm
 This folder contains the **complete, self-contained implementation of Phase 1** of the Journal Upgrade Plan: transitioning from plain FedAvg to a dual-algorithm system that supports both **FedAvg** and **FedProx**.
 
 ---

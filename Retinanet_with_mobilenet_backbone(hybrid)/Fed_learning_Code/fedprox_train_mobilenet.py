@@ -23,6 +23,7 @@ import json
 import copy
 import random
 import argparse
+import csv
 import numpy as np
 import torch
 import torch.utils.data
@@ -175,12 +176,51 @@ def fedavg_aggregate(global_model, client_models, client_sizes):
 
     for key in new_state:
         new_state[key] = sum(
-            (client_models[i].state_dict()[key].float() * client_sizes[i] / total)
+            (client_models[i].state_dict()[key].float().cpu() * client_sizes[i] / total)
             for i in range(len(client_models))
         )
 
     global_model.load_state_dict(new_state)
     return global_model
+
+
+def fedavgm_aggregate(global_model, client_models, client_sizes, global_momentum, beta=0.9, server_lr=1.0):
+    """FedAvgM: Federated Averaging with Server Momentum."""
+    total = sum(client_sizes)
+    new_state = copy.deepcopy(global_model.state_dict())
+    
+    # Calculate the pseudo-gradient (difference between old global and new fedavg)
+    pseudo_grad = {}
+    for key in new_state:
+        avg_weight = sum(
+            (client_models[i].state_dict()[key].float().cpu() * client_sizes[i] / total)
+            for i in range(len(client_models))
+        )
+        pseudo_grad[key] = new_state[key].cpu() - avg_weight
+
+    # Apply momentum and update global model
+    for key in new_state:
+        if key not in global_momentum:
+            global_momentum[key] = torch.zeros_like(new_state[key].cpu())
+        
+        global_momentum[key] = beta * global_momentum[key] + pseudo_grad[key]
+        new_state[key] = new_state[key].cpu() - server_lr * global_momentum[key]
+
+    global_model.load_state_dict(new_state)
+    return global_model, global_momentum
+
+
+def calculate_model_size_mb(model):
+    """Calculates the payload size of a model in Megabytes."""
+    param_size = 0
+    for param in model.parameters():
+        param_size += param.nelement() * param.element_size()
+    buffer_size = 0
+    for buffer in model.buffers():
+        buffer_size += buffer.nelement() * buffer.element_size()
+    
+    size_all_mb = (param_size + buffer_size) / 1024**2
+    return size_all_mb
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -196,6 +236,9 @@ def run_experiment(
     cfg=None,
     use_copy_paste=None,
     use_weighted_sampling=None,
+    num_clients=None,
+    beta=0.9,
+    seed=42
 ):
     """
     Run one full Federated Learning experiment with MobileNetV2 backbone.
@@ -204,17 +247,21 @@ def run_experiment(
         partition_mode : 'iid' or 'non_iid'
         alpha          : Dirichlet concentration (only used if non_iid)
         output_tag     : Subfolder name under OUTPUT_DIR
-        algorithm      : 'fedavg' or 'fedprox'
+        algorithm      : 'fedavg', 'fedprox', or 'fedavgm'
         mu             : Proximal coefficient (0.0 = pure FedAvg)
         cfg            : Optional config class override
+        num_clients    : Number of clients to simulate
+        beta           : Momentum parameter for FedAvgM
 
     Returns:
         history (dict): {'map50': [...], 'map75': [...], 'acc': [...]}
     """
     if cfg is None:
         cfg = MobileNetFedConfig
+        
+    num_clients = num_clients if num_clients is not None else cfg.NUM_CLIENTS
 
-    set_seed(42)
+    set_seed(seed)
     device    = cfg.DEVICE
     out_dir   = os.path.join(cfg.OUTPUT_DIR, output_tag)
     os.makedirs(out_dir, exist_ok=True)
@@ -225,8 +272,8 @@ def run_experiment(
     print("\n" + "=" * 72)
     print(f"  EXPERIMENT : {output_tag}")
     print(f"  Backbone   : MobileNetV2 (RetinaNet)")
-    print(f"  Algorithm  : {algo_str}  |  mu = {mu}")
-    print(f"  Clients    : {cfg.NUM_CLIENTS}  |  Partition: {partition_mode}")
+    print(f"  Algorithm  : {algo_str}  |  mu = {mu}  |  beta = {beta}")
+    print(f"  Clients    : {num_clients}  |  Partition: {partition_mode}")
     print(f"  Rounds     : {cfg.ROUNDS}  |  Device: {device}")
     if device.type == 'cuda':
         print(f"  GPU        : {torch.cuda.get_device_name(0)}")
@@ -256,13 +303,13 @@ def run_experiment(
 
     # ── Partition data across clients ─────────────────────────────────────────
     if partition_mode == 'iid':
-        print(f"  IID partitioning across {cfg.NUM_CLIENTS} clients...")
+        print(f"  IID partitioning across {num_clients} clients...")
         all_ids         = list(full_train.ids)
-        client_id_lists = iid_partition(all_ids, cfg.NUM_CLIENTS)
+        client_id_lists = iid_partition(all_ids, num_clients)
     else:
         print(f"  Non-IID Dirichlet partitioning (alpha={alpha})...")
         client_id_lists = noniid_dirichlet_partition(
-            full_train, cfg.NUM_CLIENTS, alpha=alpha
+            full_train, num_clients, alpha=alpha
         )
 
     client_datasets = []
@@ -294,9 +341,17 @@ def run_experiment(
 
     # ── Initialise global model ───────────────────────────────────────────────
     global_model = get_model(cfg.NUM_CLASSES).to(device)
+    model_size_mb = calculate_model_size_mb(global_model)
     best_map = 0.0
     patience_counter = 0
-    history = {'map50': [], 'map75': [], 'acc': []}
+    history = {'map50': [], 'map75': [], 'acc': [], 'comm_cost_mb': []}
+    global_momentum = {}
+    total_comm_cost_mb = 0.0
+    
+    comm_log_path = os.path.join(out_dir, 'communication_log.csv')
+    with open(comm_log_path, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['Round', 'Active_Clients', 'Payload_MB_Per_Client', 'Total_MB_This_Round', 'Cumulative_MB'])
 
     # ── Federated Training Loop ───────────────────────────────────────────────
     for rnd in range(1, cfg.ROUNDS + 1):
@@ -365,11 +420,28 @@ def run_experiment(
             avg_prox_last   = avg_prox
             print(f"Done.  Loss={avg_client_loss:.4f}  "
                   f"ProxTerm={avg_prox_last:.5f}")
-            client_models.append(local_model)
+            client_models.append(local_model.cpu()) # Offload to CPU to save GPU memory
 
         # ── Aggregation ───────────────────────────────────────────────────────
-        print("  Aggregating weights (Weighted FedAvg)...")
-        global_model = fedavg_aggregate(global_model, client_models, client_sizes)
+        if algorithm.lower() == 'fedavgm':
+            print("  Aggregating weights (FedAvgM)...")
+            global_model, global_momentum = fedavgm_aggregate(
+                global_model, client_models, client_sizes, global_momentum, beta=beta
+            )
+        else:
+            print("  Aggregating weights (Weighted FedAvg)...")
+            global_model = fedavg_aggregate(global_model, client_models, client_sizes)
+        
+        # ── Communication Cost Tracking ───────────────────────────────────────
+        # Each client downloads global model (model_size_mb) and uploads local model (model_size_mb)
+        mb_this_round = len(client_datasets) * (model_size_mb * 2)
+        total_comm_cost_mb += mb_this_round
+        
+        with open(comm_log_path, 'a', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([rnd, len(client_datasets), model_size_mb * 2, mb_this_round, total_comm_cost_mb])
+        
+        history['comm_cost_mb'].append(total_comm_cost_mb)
 
         # ── Global Evaluation ─────────────────────────────────────────────────
         print("  Evaluating global model...")
@@ -414,14 +486,16 @@ def run_experiment(
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description='MobileNetV2 FedProx / FedAvg training'
+        description='MobileNetV2 FedProx / FedAvg / FedAvgM training'
     )
     p.add_argument('--partition',  default='iid',
                    choices=['iid', 'non_iid'])
     p.add_argument('--alpha',      type=float, default=0.1)
     p.add_argument('--algorithm',  default='fedavg',
-                   choices=['fedavg', 'fedprox'])
+                   choices=['fedavg', 'fedprox', 'fedavgm'])
     p.add_argument('--mu',         type=float, default=0.0)
+    p.add_argument('--beta',       type=float, default=0.9)
+    p.add_argument('--num_clients',type=int, default=None)
     p.add_argument('--output-tag', default='mobilenet_fedavg_iid')
     return p.parse_args()
 
@@ -434,4 +508,6 @@ if __name__ == '__main__':
         output_tag=args.output_tag,
         algorithm=args.algorithm,
         mu=args.mu,
+        beta=args.beta,
+        num_clients=args.num_clients
     )

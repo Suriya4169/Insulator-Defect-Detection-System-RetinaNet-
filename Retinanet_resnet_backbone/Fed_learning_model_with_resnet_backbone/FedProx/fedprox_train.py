@@ -4,6 +4,7 @@ import json
 import copy
 import random
 import argparse
+import csv
 import numpy as np
 import torch
 import torch.utils.data
@@ -13,10 +14,8 @@ import matplotlib.pyplot as plt
 
 # ── resolve sibling imports (Fed_learning_Code lives one level up) ─────────────
 _CODE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         '..', 'Retinanet_resnet_backbone',
-                         'Fed_learning_model_with_resnet_backbone',
-                         'Fed_learning_Code')
-sys.path.insert(0, _CODE_DIR)
+                         '..', 'Fed_learning_Code')
+sys.path.insert(0, os.path.normpath(_CODE_DIR))
 
 from dataset    import CustomCocoDataset, build_defect_bank, make_weighted_sampler
 from transforms import get_transform
@@ -59,6 +58,18 @@ class FedProxConfig:
 
     DEVICE = torch.device('cuda') if torch.cuda.is_available() \
              else torch.device('cpu')
+
+def calculate_model_size_mb(model):
+    """Calculates the payload size of a model in Megabytes."""
+    param_size = 0
+    for param in model.parameters():
+        param_size += param.nelement() * param.element_size()
+    buffer_size = 0
+    for buffer in model.buffers():
+        buffer_size += buffer.nelement() * buffer.element_size()
+    
+    size_all_mb = (param_size + buffer_size) / 1024**2
+    return size_all_mb
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -190,8 +201,9 @@ def run_experiment(
     alpha: float        = 0.5,         # Dirichlet α (ignored for IID)
     output_tag: str     = '',
     rounds: int         = FedProxConfig.ROUNDS,
-    algorithm: str      = 'fedavg',    # 'fedavg' | 'fedprox'
+    algorithm: str      = 'fedavg',    # 'fedavg' | 'fedprox' | 'fedavgm'
     mu: float           = 0.0,         # proximal coefficient (0 = FedAvg)
+    beta: float         = 0.9,         # momentum coefficient for FedAvgM
 ) -> dict:
     """
     Run one complete FL experiment and return the history dict.
@@ -212,7 +224,7 @@ def run_experiment(
 
     print(f"\n{'='*72}")
     print(f"  EXPERIMENT : {tag_str}")
-    print(f"  Algorithm  : {algorithm.upper()}  |  mu = {mu}")
+    print(f"  Algorithm  : {algorithm.upper()}  |  mu = {mu}  |  beta = {beta}")
     print(f"  Clients    : {num_clients}  |  Partition: {partition_mode}"
           + (f"  alpha={alpha}" if partition_mode == 'non_iid' else ""))
     print(f"  Rounds     : {rounds}  |  Device: {FedProxConfig.DEVICE}")
@@ -270,11 +282,20 @@ def run_experiment(
     class_names    = {0: 'background', 1: 'defect', 2: 'insulator'}
 
     history    = {'loss': [], 'accuracy': [], 'map50': [], 'map75': [],
-                  'prox_loss': []}
+                  'prox_loss': [], 'comm_cost_mb': []}
     best_map50 = 0.0
     latest_acc = 0.0
     latest_map = 0.0
     early_stop = EarlyStopping(patience=3, min_delta=0.005)
+    
+    model_size_mb = calculate_model_size_mb(global_model)
+    global_momentum = {}
+    total_comm_cost_mb = 0.0
+    
+    comm_log_path = os.path.join(out_dir, 'communication_log.csv')
+    with open(comm_log_path, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['Round', 'Active_Clients', 'Payload_MB_Per_Client', 'Total_MB_This_Round', 'Cumulative_MB'])
 
     # ── 4. FL rounds ──────────────────────────────────────────────────────────
     for round_idx in range(rounds):
@@ -362,25 +383,52 @@ def run_experiment(
             avg_prox = client_prox / FedProxConfig.CLIENT_EPOCHS
             round_losses.append(avg_loss)
             round_prox.append(avg_prox)
-            local_weights.append(copy.deepcopy(client_model.state_dict()))
+            local_weights.append(copy.deepcopy(client_model.cpu().state_dict()))
             print(f"Done.  Loss={avg_loss:.4f}  ProxTerm={avg_prox:.5f}")
 
             del client_model
             torch.cuda.empty_cache()
 
-        # ── Weighted FedAvg aggregation (UNCHANGED for FedProx) ───────────────
-        print("  Aggregating weights (Weighted FedAvg)...")
+        # ── Aggregation ───────────────────────────────────────────────────────
         sizes  = [len(ds) for ds in client_datasets]
         total  = sum(sizes)
         w_frac = [s / total for s in sizes]
 
-        global_weights = copy.deepcopy(local_weights[0])
-        for key in global_weights.keys():
-            global_weights[key] = sum(
-                wf * lw[key].float()
-                for wf, lw in zip(w_frac, local_weights)
-            ).to(global_weights[key].dtype)
+        if algorithm.lower() == 'fedavgm':
+            print("  Aggregating weights (FedAvgM)...")
+            pseudo_grad = {}
+            for key in global_weights.keys():
+                avg_weight = sum(
+                    wf * lw[key].float()
+                    for wf, lw in zip(w_frac, local_weights)
+                )
+                pseudo_grad[key] = global_weights[key].cpu().float() - avg_weight
+                
+            for key in global_weights.keys():
+                if key not in global_momentum:
+                    global_momentum[key] = torch.zeros_like(global_weights[key].cpu().float())
+                global_momentum[key] = beta * global_momentum[key] + pseudo_grad[key]
+                global_weights[key] = (global_weights[key].cpu().float() - global_momentum[key]).to(global_weights[key].dtype)
+        else:
+            print("  Aggregating weights (Weighted FedAvg)...")
+            global_weights = copy.deepcopy(local_weights[0])
+            for key in global_weights.keys():
+                global_weights[key] = sum(
+                    wf * lw[key].float()
+                    for wf, lw in zip(w_frac, local_weights)
+                ).to(global_weights[key].dtype)
+                
         global_model.load_state_dict(global_weights)
+        
+        # ── Communication Cost Tracking ───────────────────────────────────────
+        mb_this_round = len(client_datasets) * (model_size_mb * 2)
+        total_comm_cost_mb += mb_this_round
+        
+        with open(comm_log_path, 'a', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([round_idx+1, len(client_datasets), model_size_mb * 2, mb_this_round, total_comm_cost_mb])
+        
+        history['comm_cost_mb'].append(total_comm_cost_mb)
 
         # ── Record metrics ────────────────────────────────────────────────────
         history['loss'].append(sum(round_losses) / len(round_losses))
@@ -437,9 +485,9 @@ def parse_args():
     p = argparse.ArgumentParser(
         description='FedProx Federated Training (Phase 1 — Journal Upgrade)'
     )
-    p.add_argument('--algorithm',  choices=['fedavg', 'fedprox'],
+    p.add_argument('--algorithm',  choices=['fedavg', 'fedprox', 'fedavgm'],
                    default='fedavg',
-                   help='fedavg (mu forced to 0) or fedprox')
+                   help='fedavg, fedprox, or fedavgm')
     p.add_argument('--mu',         type=float, default=0.01,
                    help='FedProx proximal coefficient. Ignored for fedavg.')
     p.add_argument('--partition',  choices=['iid', 'non_iid'],
@@ -447,6 +495,8 @@ def parse_args():
                    help='Data partitioning strategy')
     p.add_argument('--alpha',      type=float, default=0.5,
                    help='Dirichlet alpha for Non-IID (lower = more skewed)')
+    p.add_argument('--beta',       type=float, default=0.9,
+                   help='FedAvgM momentum coefficient.')
     p.add_argument('--clients',    type=int, default=FedProxConfig.NUM_CLIENTS)
     p.add_argument('--rounds',     type=int, default=FedProxConfig.ROUNDS)
     p.add_argument('--tag',        type=str, default='',
@@ -465,6 +515,7 @@ def main():
         rounds         = args.rounds,
         algorithm      = args.algorithm,
         mu             = mu,
+        beta           = args.beta,
     )
 
 

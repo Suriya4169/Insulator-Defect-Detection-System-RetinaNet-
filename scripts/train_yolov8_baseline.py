@@ -3,6 +3,7 @@ import sys
 import json
 import shutil
 import yaml
+import torch
 from ultralytics import YOLO
 
 DATA_PATH = r'D:\Fed learning project\Dataset - IDD-CPLID.v3-cplid_new.coco'
